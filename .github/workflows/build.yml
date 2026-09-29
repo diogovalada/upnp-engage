@@ -2,54 +2,82 @@ name: Build and Test
 
 on:
   push:
-    branches: [ main ]
-    paths-ignore:
-      - '**.md'
-      - '.gitignore'
-      - 'LICENSE'
+    branches: ['**']
   pull_request:
-    branches: [ main ]
-    paths-ignore:
-      - '**.md'
-      - '.gitignore'
-      - 'LICENSE'
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+            rustflags: -C target-feature=+crt-static
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            rustflags: ''
+          - os: macos-14
+            platform: macos-arm64
+            rustflags: ''
+          - os: macos-15-intel
+            platform: macos-x86_64
+            rustflags: ''
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Cache Rust dependencies and build outputs
-        uses: actions/cache@v3
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-          
-      - name: Build
-        run: cargo build --release
-        
-      - name: Run tests
-        run: cargo test --release
-        
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v3
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.93-static-${{ hashFiles('Cargo.lock') }}
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Test release validation
+        run: python tests/test_release.py
+      - name: Test Unix terminal and clipboard
+        if: runner.os != 'Windows'
+        run: python3 tests/terminal_unix.py
+      - name: Test Windows console close
+        if: runner.os == 'Windows'
+        run: python tests/windows_console.py
+      - name: Test release build
+        run: cargo test --locked --release
+      - name: Test Unix release terminal and clipboard
+        if: runner.os != 'Windows'
+        run: python3 tests/terminal_unix.py target release
+      - name: Test Windows release console close
+        if: runner.os == 'Windows'
+        run: python tests/windows_console.py target release
+      - name: Build executable
+        run: cargo build --locked --release
+      - name: Package tested executable
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python scripts/package.py
+      - uses: actions/upload-artifact@v6
         with:
-          name: build-artifacts-${{ github.sha }}
-          path: |
-            target/release/*.exe
-            SHA.txt
-          retention-days: 1
-
-      - name: Save SHA
-        run: echo ${{ github.sha }} > SHA.txt
+          name: upnp-engage-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

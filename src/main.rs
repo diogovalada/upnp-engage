@@ -1,251 +1,300 @@
+mod cli;
 mod config;
-mod deferred_task;
+mod gateway;
 mod platform;
+mod session;
+mod ui;
 
-use config::Config;
-use deferred_task::DeferredTask;
-use igd::search_gateway;
-use igd::PortMappingProtocol;
-use local_ip_address;
-use platform::windows::register_windows_console_ctrl_handler;
-use std::env;
-use std::io;
-use std::net::Ipv4Addr;
-use std::net::SocketAddrV4;
-use std::process;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::OnceLock;
-use tokio::time::{self, Duration};
+use anyhow::{anyhow, bail, Context, Result};
+use clap::Parser;
+use config::{Config, ConfigFile};
+use crossterm::event::KeyCode;
+use platform::{launch, shutdown::Shutdown};
+use session::{Command, Status};
+use std::{env, future, io, process::ExitCode, sync::Arc};
+use tokio::sync::{mpsc, oneshot, watch};
+use ui::Ui;
 
-const LEASE_TIME: u32 = 3600;
-const LEASE_RENEWAL_INTERVAL: u32 = 3000;
-const CONNECTION_NAME: &str = "Rust UPnP Port Forwarder";
-
-static TASK_OPEN_AND_MAINTAIN_CONNECTION: OnceLock<Arc<Mutex<DeferredTask>>> = OnceLock::new();
-
-fn get_config_path() -> io::Result<std::path::PathBuf> {
-    let current_dir = env::current_dir()?;
-    Ok(current_dir.join("config.toml"))
+#[tokio::main]
+async fn main() -> ExitCode {
+    let args = cli::Args::parse();
+    match launch::maybe_launch(&args) {
+        Ok(true) => return ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error:#}");
+            return ExitCode::FAILURE;
+        }
+        Ok(false) => {}
+    }
+    let shutdown = Shutdown::new();
+    let result = async {
+        shutdown.install()?;
+        run(args, shutdown.clone(), None).await
+    }
+    .await;
+    shutdown.finish();
+    if let Err(error) = result {
+        eprintln!("\n{error:#}");
+        if launch::owns_console() && launch::interactive() && !shutdown.is_requested() {
+            eprintln!("Press Enter to close.");
+            let _ = io::stdin().read_line(&mut String::new());
+        }
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
-// async fn cleanup_ports(gateway: &igd::aio::Gateway, router_port: u16) {
-//     // Remove TCP port mapping
-//     let _ = File::create("empty_clean.txt");
-//     match gateway
-//         .remove_port(PortMappingProtocol::TCP, router_port)
-//         .await
-//     {
-//         Ok(_) => println!("TCP port mapping removed successfully."),
-//         Err(e) => eprintln!("Failed to remove TCP port mapping: {}", e),
-//     }
+async fn run(
+    args: cli::Args,
+    shutdown: Arc<Shutdown>,
+    router: Option<Box<dyn gateway::Router>>,
+) -> Result<()> {
+    let interactive = !args.non_interactive && launch::interactive();
+    if args.interactive && !interactive {
+        bail!("Interactive setup needs a terminal. Open a terminal and run upnp-engage there.");
+    }
+    let mut ui = Ui::new(interactive)?;
+    let user_path = config::user_config_path();
+    let mut file = config::discover(
+        args.config.as_deref(),
+        &env::current_exe()?,
+        &env::current_dir()?,
+        user_path.as_deref(),
+    )?;
+    if let Some(issue) = &file.issue {
+        if !interactive || args.save_config {
+            bail!("{issue}");
+        }
+        ui.line(issue)?;
+        if !ui
+            .confirm("Enter settings for this run?", true, &shutdown)
+            .await?
+        {
+            return Ok(());
+        }
+    } else if file.exists() {
+        ui.line(&format!("Loaded {}", file.path.display()))?;
+    }
+    let mut settings = file.config.overlay(args.device_port, args.router_port);
+    let prompted = args.interactive || settings.device_port == 0 || file.issue.is_some();
+    if prompted {
+        if !interactive {
+            bail!("A device port is missing. Set device_port in {} or pass --device-port PORT. Run from a terminal for guided setup.", file.path.display());
+        }
+        let Some(selected) = ui.ports(settings, &shutdown).await? else {
+            return Ok(());
+        };
+        settings = selected;
+    }
+    settings.validate()?;
+    if shutdown.is_requested() {
+        return Ok(());
+    }
+    if args.save_config {
+        file.save(settings, false)?;
+        ui.line(&format!("Saved {}", file.path.display()))?;
+    } else if prompted {
+        offer_save(&mut ui, &mut file, settings, &shutdown).await?;
+    }
+    if shutdown.is_requested() {
+        return Ok(());
+    }
 
-//     // Remove UDP port mapping
-//     match gateway
-//         .remove_port(PortMappingProtocol::UDP, router_port)
-//         .await
-//     {
-//         Ok(_) => println!("UDP port mapping removed successfully."),
-//         Err(e) => eprintln!("Failed to remove UDP port mapping: {}", e),
-//     }
-// }
+    let (commands, receiver) = mpsc::channel(1);
+    let (updates, statuses) = watch::channel(Status::default());
+    let worker = tokio::spawn(session::worker(receiver, updates, shutdown.clone(), router));
+    let result = control(&mut ui, &mut file, settings, &commands, statuses, &shutdown).await;
+    shutdown.request();
+    drop(commands);
+    let cleanup = worker.await.context("Forwarding worker failed")?;
+    match (result, cleanup) {
+        (Err(error), Err(cleanup)) => Err(anyhow!("{error:#}\nCleanup: {cleanup:#}")),
+        (Err(error), _) => Err(error),
+        (_, cleanup) => cleanup,
+    }
+}
 
-async fn open_and_keep_active(gateway: igd::Gateway, device_port: u16, external_port: u16) {
-    let local_ip = local_ip_address::local_ip()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to get local IP: {}", e);
-            process::exit(1);
-        })
-        .to_string();
-    let local_ip = Ipv4Addr::from_str(&local_ip).unwrap();
-    let external_ip = gateway.get_external_ip().unwrap_or_else(|e| {
-        eprintln!("Failed to get external IP: {}", e);
-        process::exit(1);
-    });
-    let renewal_interval = Duration::from_secs(LEASE_RENEWAL_INTERVAL.into());
-    let mut first_run = true;
+async fn offer_save(
+    ui: &mut Ui,
+    file: &mut ConfigFile,
+    settings: Config,
+    shutdown: &Shutdown,
+) -> Result<()> {
+    let label = if file.issue.is_some() {
+        "Replace the invalid config"
+    } else {
+        "Save these settings"
+    };
+    if !ui
+        .confirm(
+            &format!("{label} at {}?", file.path.display()),
+            !file.exists(),
+            shutdown,
+        )
+        .await?
+        || shutdown.is_requested()
+    {
+        return Ok(());
+    }
+    if let Err(error) = file.save(settings, file.issue.is_some()) {
+        ui.line(&format!("Settings were not saved: {error:#}"))?;
+        if !file.explicit && !file.exists() {
+            if let Some(path) = config::user_config_path().filter(|path| *path != file.path) {
+                if ui
+                    .confirm(
+                        &format!("Save to {} instead?", path.display()),
+                        true,
+                        shutdown,
+                    )
+                    .await?
+                    && !shutdown.is_requested()
+                {
+                    let mut fallback = match ConfigFile::open(path, false) {
+                        Ok(file) => file,
+                        Err(error) => {
+                            ui.line(&format!("Settings were not saved: {error:#}"))?;
+                            return Ok(());
+                        }
+                    };
+                    // Never overwrite an existing fallback file without first loading it normally.
+                    if fallback.exists() {
+                        ui.line(
+                            "A config already exists there. Restart to load it before saving.",
+                        )?;
+                    } else {
+                        match fallback.save(settings, false) {
+                            Ok(()) => {
+                                ui.line(&format!("Saved {}", fallback.path.display()))?;
+                                *file = fallback;
+                            }
+                            Err(error) => {
+                                ui.line(&format!("Settings were not saved: {error:#}"))?
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        ui.line(&format!("Saved {}", file.path.display()))?;
+    }
+    Ok(())
+}
 
+async fn apply(
+    commands: &mpsc::Sender<Command>,
+    config: Config,
+) -> Result<oneshot::Receiver<Result<(), String>>> {
+    let (reply, response) = oneshot::channel();
+    commands
+        .send(Command::Apply(config, reply))
+        .await
+        .context("Forwarding worker closed")?;
+    Ok(response)
+}
+
+async fn control(
+    ui: &mut Ui,
+    file: &mut ConfigFile,
+    initial: Config,
+    commands: &mpsc::Sender<Command>,
+    mut statuses: watch::Receiver<Status>,
+    shutdown: &Shutdown,
+) -> Result<()> {
+    let mut pending = Some(apply(commands, initial).await?);
+    let mut save_after = false;
+    let mut status = Status::default();
     loop {
-        // Add/Renew TCP Port Mapping
-        match gateway.add_port(
-            igd::PortMappingProtocol::TCP,
-            external_port,
-            SocketAddrV4::new(local_ip, device_port),
-            // external IP works, router recognizes itself
-            LEASE_TIME,
-            &format!("{} - TCP", CONNECTION_NAME),
-        ) {
-            Ok(_) => {
-                if first_run {
-                    println!("✓ TCP port active.");
-                } else {
-                    println!("✓ TCP port renewed.");
+        tokio::select! {
+            biased;
+            _ = shutdown.wait() => break,
+            result = async {
+                match pending.as_mut() {
+                    Some(response) => response.await,
+                    None => future::pending().await,
+                }
+            } => {
+                pending = None;
+                let result = result.context("Forwarding worker stopped before replying")?;
+                status = statuses.borrow_and_update().clone();
+                ui.show(&status)?;
+                if let Err(error) = result {
+                    if !ui.interactive { bail!("{error}"); }
+                } else if save_after {
+                    offer_save(ui, file, status.config, shutdown).await?;
+                    ui.show(&statuses.borrow().clone())?;
+                }
+                save_after = false;
+            }
+            changed = statuses.changed() => {
+                changed.context("Forwarding worker stopped unexpectedly")?;
+                status = statuses.borrow_and_update().clone();
+                ui.show(&status)?;
+                if !status.active && !status.busy && pending.is_none() && !ui.interactive { bail!("{}", status.message); }
+            }
+            key = ui.key(shutdown), if ui.interactive => {
+                let Some(key) = key? else { break; };
+                match key.code {
+                    KeyCode::Char('q' | 'Q') => { shutdown.request(); break; }
+                    KeyCode::Char('c' | 'C') => ui.copy(&statuses.borrow().clone())?,
+                    KeyCode::Char('p' | 'P') if pending.is_none() => {
+                        if let Some(config) = ui.ports(status.config, shutdown).await? {
+                            if !shutdown.is_requested() {
+                                pending = Some(apply(commands, config).await?);
+                                save_after = true;
+                            }
+                        }
+                        ui.show(&statuses.borrow().clone())?;
+                    }
+                    _ => {},
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "Failed to {} TCP port mapping: {}",
-                    if first_run { "add" } else { "renew" },
-                    e
-                );
-                process::exit(1);
-            }
         }
-
-        // Add/Renew UDP Port Mapping
-        match gateway.add_port(
-            igd::PortMappingProtocol::UDP,
-            external_port,
-            SocketAddrV4::new(local_ip, device_port),
-            LEASE_TIME,
-            &format!("{} - UDP", CONNECTION_NAME),
-        ) {
-            Ok(_) => {
-                if first_run {
-                    println!("✓ UDP port active.");
-                } else {
-                    println!("✓ UDP port renewed.");
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "Failed to {} UDP port mapping: {}",
-                    if first_run { "add" } else { "renew" },
-                    e
-                );
-                process::exit(1);
-            }
-        }
-
-        if first_run {
-            println!("");
-            println!("Port forwarding is active.");
-            println!("\nLocal IP:");
-            println!("{}:{}", local_ip, device_port);
-            println!("\nExternal IP:");
-            println!("{}:{}", external_ip, external_port);
-            println!("");
-            println!("Press Ctrl+C to terminate.");
-        }
-
-        first_run = false;
-        time::sleep(renewal_interval).await;
     }
+    ui.line("\nStopping port forwarding...")?;
+    Ok(())
 }
 
-fn cleanup_ports(gateway: igd::Gateway, router_port: u16) {
-    // Create or truncate the "empty_clean.txt" file
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Remove TCP port mapping
-    match gateway.remove_port(PortMappingProtocol::TCP, router_port) {
-        Ok(_) => println!("TCP port mapping removed successfully."),
-        Err(e) => eprintln!("Failed to remove TCP port mapping: {}", e),
-    }
-
-    // Remove UDP port mapping
-    match gateway.remove_port(PortMappingProtocol::UDP, router_port) {
-        Ok(_) => println!("UDP port mapping removed successfully."),
-        Err(e) => eprintln!("Failed to remove UDP port mapping: {}", e),
-    }
-}
-
-fn shutdown_program(gateway: igd::Gateway, external_port: u16) {
-    if TASK_OPEN_AND_MAINTAIN_CONNECTION.get().is_none() {
-        return;
-    }
-
-    let task = TASK_OPEN_AND_MAINTAIN_CONNECTION
-        .get()
-        .unwrap()
-        .lock()
+    /// An opt-in PTY fixture. It uses the real UI with an in-memory router.
+    #[test]
+    #[ignore]
+    fn interactive_fixture() {
+        let Some(log) = env::var_os("UPNP_TEST_LOG").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let path = env::var_os("UPNP_TEST_CONFIG").expect("fixture config path");
+        let args = cli::Args::try_parse_from([
+            std::ffi::OsString::from("upnp-engage"),
+            "--config".into(),
+            path,
+        ])
         .unwrap();
-    task.abort_and_wait();
-    cleanup_ports(gateway, external_port);
-}
-
-// #[tokio::main]
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let config_path = match get_config_path() {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("Error getting current directory: {}", e);
-            process::exit(1);
-        }
-    };
-
-    let config = Config::load_or_create(&config_path).unwrap();
-
-    let device_port = config.device_port;
-    let external_port = config.router_port;
-
-    // Discover the gateway
-    let gateway = match search_gateway(Default::default()) {
-        Ok(gw) => gw,
-        Err(e) => {
-            eprintln!("Failed to discover gateway: {}", e);
-            process::exit(1);
-        }
-    };
-
-    // register_windows_console_ctrl_handler(|| {
-    //     thread::sleep(Duration::from_secs(2));
-    //     keep_active_handle.abort();
-    //     cleanup_ports(gateway, external_port);
-    // });
-
-    // Two issues:
-    //
-
-    // register_windows_console_ctrl_handler(|| {
-    //     thread::sleep(Duration::from_secs(4));
-    // });
-
-    let future_connection = open_and_keep_active(gateway.clone(), device_port, external_port);
-    let task_connection = DeferredTask::new(future_connection);
-    TASK_OPEN_AND_MAINTAIN_CONNECTION
-        .set(Arc::new(Mutex::new(task_connection)))
-        .unwrap();
-
-    // Register cleanups
-    let gateway_clone = gateway.clone();
-    std::panic::set_hook(Box::new(move |_| {
-        tokio::runtime::Handle::current().block_on(async {
-            shutdown_program(gateway_clone.clone(), external_port);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let shutdown = Shutdown::new();
+            shutdown.install().unwrap();
+            let result = run(
+                args,
+                shutdown.clone(),
+                Some(session::tests::fixture_router(log)),
+            )
+            .await;
+            shutdown.finish();
+            result.unwrap();
         });
-    }));
-    let gateway_clone = gateway.clone();
-    register_windows_console_ctrl_handler(move || {
-        shutdown_program(gateway_clone.clone(), external_port);
-    });
+    }
 
-    // Start the connection task
-    TASK_OPEN_AND_MAINTAIN_CONNECTION
-        .get()
-        .unwrap()
-        .lock()
-        .unwrap()
-        .start();
-
-    // Handle both Ctrl+C and terminal close
-    // #[cfg(target_family = "unix")]
-    // let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    //     .expect("Failed to create signal handler");
-
-    // #[cfg(windows)]
-    // let mut close_handler =
-    //     tokio::signal::windows::ctrl_close().expect("Failed to create ctrl_close signal handler");
-    // #[cfg(windows)]
-    // let close_signal = close_handler.recv();
-
-    // let ctrl_c_signal = tokio::signal::ctrl_c();
-
-    // tokio::select! {
-    //     _ = close_signal  => {}
-    //     _ = ctrl_c_signal => {}
-    // }
-
-    // Keep the program running. Shutdown handled by the ConsoleCtrlHandler
-    tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
+    #[test]
+    #[ignore]
+    fn clipboard_fixture() {
+        let Some(path) = env::var_os("UPNP_TEST_CLIPBOARD") else {
+            return;
+        };
+        let text = arboard::Clipboard::new().unwrap().get_text().unwrap();
+        std::fs::write(path, text).unwrap();
+    }
 }

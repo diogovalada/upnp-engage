@@ -1,4 +1,9 @@
 /target
+/dist
+/artifacts
+/release
+/release-notes.txt
+__pycache__/
 .aider*
 .env
 config.toml

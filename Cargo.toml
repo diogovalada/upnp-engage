@@ -2,25 +2,36 @@
 name = "upnp-engage"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.93"
 
 [dependencies]
-igd = { version = "*", features = ["aio"] }
-serde = { version = "1", features = ["derive"] }
-toml = "0.5"
-tokio = { version = "1", features = ["macros", "rt"] }
-winapi = { version = "*", features = ["minwindef", "consoleapi"] }
-once_cell = "*"
-local-ip-address = "*"
+anyhow = "1"
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = "0.3"
+hyper = { version = "0.14", features = ["client", "http1", "tcp"] }
+igd = { version = "0.12.1", features = ["aio"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net"] }
+toml_edit = "0.22"
+xmltree = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = ["minwindef", "consoleapi", "wincon"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+hyper = { version = "0.14", features = ["server"] }
 
 [profile.release]
 opt-level = "z"
 debug = false
-split-debuginfo = '...'  # Platform-specific.
 strip = true
 debug-assertions = false
 overflow-checks = false
 lto = true
-panic = 'abort'
 incremental = false
 codegen-units = 1
 rpath = false

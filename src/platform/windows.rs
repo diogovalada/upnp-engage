@@ -1,47 +1,44 @@
-use std::process;
-use winapi::shared::minwindef::{BOOL, TRUE};
+use super::shutdown::Shutdown;
+use anyhow::{bail, Result};
+use std::sync::{Arc, OnceLock};
+use winapi::shared::minwindef::{BOOL, DWORD, FALSE, TRUE};
 use winapi::um::consoleapi::SetConsoleCtrlHandler;
+use winapi::um::wincon::{
+    CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+};
 
-// unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> BOOL {
-//     thread::sleep(Duration::from_secs(4));
-//     TRUE
-// }
+static SHUTDOWN: OnceLock<Arc<Shutdown>> = OnceLock::new();
 
-// pub fn register_windows_console_ctrl_handler(_exit_flag: Option<Arc<AtomicBool>>) {
-//     unsafe {
-//         if SetConsoleCtrlHandler(Some(ctrl_handler), TRUE) == 0 {
-//             panic!("Error setting up CTRL+C handler");
-//         }
-//     }
-// }
-
-use once_cell::sync::Lazy;
-use std::sync::Mutex;
-
-type CtrlHandlerFn = Box<dyn Fn() + Send + 'static>;
-static CTRL_HANDLER: Lazy<Mutex<Option<CtrlHandlerFn>>> = Lazy::new(|| Mutex::new(None));
-
-unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> BOOL {
-    if let Ok(guard) = CTRL_HANDLER.lock() {
-        if let Some(callback) = guard.as_ref() {
-            callback();
-        }
-    }
-    process::exit(0);
-    // TRUE
-}
-
-pub fn register_windows_console_ctrl_handler<F>(callback: F)
-where
-    F: Fn() + Send + 'static,
-{
-    if let Ok(mut handler) = CTRL_HANDLER.lock() {
-        *handler = Some(Box::new(callback));
-
-        unsafe {
-            if SetConsoleCtrlHandler(Some(ctrl_handler), TRUE) == 0 {
-                panic!("Error setting up CTRL+C handler");
+unsafe extern "system" fn handler(event: DWORD) -> BOOL {
+    match event {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+        | CTRL_SHUTDOWN_EVENT => {
+            if let Some(shutdown) = SHUTDOWN.get() {
+                shutdown.request();
+                // Windows terminates the process when a close callback returns.
+                // Keep this thread alive while the normal runtime performs cleanup.
+                if matches!(
+                    event,
+                    CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+                ) {
+                    shutdown.wait_for_cleanup();
+                }
+                TRUE
+            } else {
+                FALSE
             }
         }
+        _ => FALSE,
     }
+}
+
+pub fn install(shutdown: Arc<Shutdown>) -> Result<()> {
+    if SHUTDOWN.set(shutdown).is_err() {
+        bail!("Console shutdown handling is already installed");
+    }
+    // SAFETY: handler has the required ABI and its shared state lives for the process lifetime.
+    if unsafe { SetConsoleCtrlHandler(Some(handler), TRUE) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }

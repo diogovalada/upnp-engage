@@ -1,77 +1,48 @@
-name: Create Release
+name: Release
 
 on:
   push:
-    branches: [ main ]
+    tags: ['v*.*.*']
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: windows-latest
+  version:
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
-      
-      # Try to download artifacts from PR build
-      - name: Download PR artifacts
-        id: download
-        uses: dawidd6/action-download-artifact@v2
-        continue-on-error: true
+          persist-credentials: false
+      - name: Check tag, crate version, and release notes
+        run: python3 scripts/release.py validate
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
         with:
-          workflow: build.yml
-          workflow_conclusion: success
-          name: build-artifacts-${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: upnp-engage-*
           path: artifacts
-
-      # Verify SHA matches
-      - name: Verify build SHA
-        id: verify
-        if: steps.download.outcome == 'success'
-        run: |
-          $expected_sha = Get-Content artifacts/SHA.txt
-          if ($expected_sha -ne "${{ github.sha }}") {
-            echo "SHA mismatch - need fresh build"
-            exit 1
-          }
-          
-      - name: Install Rust
-        if: steps.download.outcome == 'failure' || steps.verify.outcome == 'failure'
-        uses: dtolnay/rust-toolchain@stable
-        
-      - name: Cache Rust dependencies and build outputs
-        if: steps.download.outcome == 'failure' || steps.verify.outcome == 'failure'
-        uses: actions/cache@v3
+      - name: Verify all four artifacts and prepare release files
+        run: python3 scripts/release.py assemble
+      - uses: softprops/action-gh-release@v3
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-        
-      - name: Build
-        if: steps.download.outcome == 'failure' || steps.verify.outcome == 'failure'
-        run: cargo build --release
-        
-      - name: Move build artifacts
-        if: steps.download.outcome == 'failure' || steps.verify.outcome == 'failure'
-        run: |
-          mkdir artifacts
-          move target/release/*.exe artifacts/
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: artifacts/*.exe
-          tag_name: release-${{ github.sha }}
-          name: Release ${{ github.sha }}
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: release-notes.txt
+          files: release/*
+          fail_on_unmatched_files: true
+          make_latest: true

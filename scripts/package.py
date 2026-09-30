@@ -1,10 +1,12 @@
-"""Package one tested executable, retaining Unix permissions inside Mac ZIPs."""
+"""Package one tested executable, retaining Unix permissions inside archives."""
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import zipfile
 
 platform = os.environ["PLATFORM"]
@@ -26,6 +28,25 @@ if platform.startswith("macos-"):
     with zipfile.ZipFile(asset, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.write(command, command.name)
     command.unlink()
+elif platform.startswith("linux-"):
+    asset = dist / (name + ".tar.gz")
+    with tarfile.open(asset, "w:gz") as archive:
+        entry = archive.gettarinfo(binary, arcname=name)
+        entry.mode = 0o755
+        entry.uid = entry.gid = 0
+        entry.uname = entry.gname = ""
+        with binary.open("rb") as contents:
+            archive.addfile(entry, contents)
+    # Check the actual download path: extracting must produce a runnable file,
+    # without requiring users to fix its permissions themselves.
+    with tempfile.TemporaryDirectory(prefix="upnp-package-") as directory:
+        subprocess.run(["tar", "-xzf", str(asset.resolve()), "-C", directory], check=True)
+        extracted = Path(directory) / name
+        if extracted.stat().st_mode & 0o777 != 0o755:
+            raise ValueError("Linux archive did not preserve executable permissions")
+        actual = subprocess.check_output([str(extracted), "--version"], text=True).strip()
+        if actual != f"upnp-engage {version}":
+            raise ValueError("Linux archive contains an unexpected executable version")
 else:
     asset = dist / (name + (".exe" if platform.startswith("windows-") else ""))
     shutil.copy2(binary, asset)

@@ -8,10 +8,9 @@ Download the executable for your system from [Releases](https://github.com/diogo
 
 - **Windows:** double-click the `.exe`.
 - **Mac:** download the Apple Silicon (`arm64`) or Intel (`x86_64`) ZIP, extract it, and double-click `upnp-engage.command`. It opens in Terminal. If macOS blocks the first launch, go to **System Settings → Privacy & Security → Open Anyway**, then confirm **Open**. These builds are not Developer ID signed or notarized. If needed, drag the executable into Terminal and press Return.
-- **Linux:** allow the downloaded file to run as a program in its file properties, then open it. If your desktop doesn't launch it, use a terminal:
+- **Linux:** extract the `.tar.gz` using your file manager, then open `upnp-engage-linux-x86_64`. The archive preserves its permission to run. If your desktop doesn't launch it, open a terminal in the extracted folder and run:
 
   ```sh
-  chmod +x upnp-engage-linux-x86_64
   ./upnp-engage-linux-x86_64
   ```
 

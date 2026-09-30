@@ -27,7 +27,7 @@ def validate():
 def assemble(version, notes):
     expected = {
         "windows-x86_64": "upnp-engage-windows-x86_64.exe",
-        "linux-x86_64": "upnp-engage-linux-x86_64",
+        "linux-x86_64": "upnp-engage-linux-x86_64.tar.gz",
         "macos-arm64": "upnp-engage-macos-arm64.zip",
         "macos-x86_64": "upnp-engage-macos-x86_64.zip",
     }

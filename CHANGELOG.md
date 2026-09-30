@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.1
+
+- Linux downloads now come as a `.tar.gz` containing the executable with its run permissions preserved. Extract it with your file manager; no `chmod` step is needed on a filesystem that supports Unix permissions.
+- CI extracts the Linux archive and runs the packaged executable before publishing it.
+
+Application behavior is unchanged. Windows downloads remain `.exe` files and Mac downloads remain ZIPs.
+
 ## v0.1.0
 
 First versioned release of UPnP Engage.

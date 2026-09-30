@@ -26,7 +26,7 @@ class ReleaseTests(unittest.TestCase):
         Path("Cargo.toml").write_text('[package]\nversion = "0.1.0"\n[dependencies]\n')
         Path("CHANGELOG.md").write_text("# Changelog\n\n## v0.1.0\n\nNew release.\n\n## v0.0.1\n\nOld notes.\n")
         self.assets = []
-        for platform, suffix in [("windows-x86_64", ".exe"), ("linux-x86_64", ""), ("macos-arm64", ".zip"), ("macos-x86_64", ".zip")]:
+        for platform, suffix in [("windows-x86_64", ".exe"), ("linux-x86_64", ".tar.gz"), ("macos-arm64", ".zip"), ("macos-x86_64", ".zip")]:
             folder = Path("artifacts") / f"upnp-engage-{platform}"
             folder.mkdir(parents=True)
             asset = folder / f"upnp-engage-{platform}{suffix}"
